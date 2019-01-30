@@ -3,29 +3,27 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
     public = list(
       sce = NULL,
       network = NULL,
-      metacell.network = NULL,
       backbone.network = NULL,
+      archetype.profiles = NULL,
+      smoothed.archetype.profiles = NULL,
+      archetype.signatures = NULL,
       print = function(...) {
         cat("<ACTIONnet> of ", dim(self$.__enclos_env__$private$items$counts)[1], " genes and ", dim(self$.__enclos_env__$private$items$counts)[2],  " cells \n", sep = "")
       invisible(self)
       },
       ################################################################
-      run_ACTIONnet_analysis = function(..., IncolData=NULL, InrowData=NULL, geneFilter = 2, cellFilter = 200, PCAdim=30, Kmin=2, Kmax = 20, NThreads=4, Knn = 30, Ntop=10, Ngenes=NULL, AllAttrib=TRUE, AttribVec="", iters2D = 100, repForcesStrength2D = 5, Iters3Dapp=0, Negweigths3Dapp=1) {
-        self$build_sce(IncolData = IncolData, InrowData = InrowData, geneFilter = geneFilter, cellFilter = cellFilter)
+      run_ACTIONnet_analysis = function(..., buildSce=TRUE, IncolData=NULL, InrowData=NULL, geneFilter = 2, cellFilter = 200, PCAdim=30, RedMethod = 1, Kmin=2, Kmax = 20, NThreads=4, NetMNN=0, Netsmooth_knn=1, Ntop=10, Ngenes=NULL, AllAttrib=TRUE, AttribVec="", iters2D = 100, repForcesStrength2D = 5, Iters3Dapp=0, Negweigths3Dapp=1, N_epochs=100, Compactness_level=50) {
+        if(buildSce==TRUE) self$build_sce(IncolData = IncolData, InrowData = InrowData, geneFilter = geneFilter, cellFilter = cellFilter)
         self$normalize_dge()
-        self$reduce_dge(PCAdim = PCAdim)
+        self$reduce_dge(PCAdim = PCAdim, RedMethod = RedMethod)
         self$decompose_sce(Kmin = Kmin, Kmax = Kmax, NThreads = NThreads)
-        self$build_cellnetwork(Kmax = Kmax, Knn = Knn, NThreads = NThreads)
-        self$extract_archetypal_patterns()
-        self$compute_gene_metacell_contribution()
-        self$refine_metacell_space()
+        self$postprocess_archetypes()
+        self$build_cellnetwork(Kmax = Kmax, NThreads = NThreads, NetMNN=NetMNN, Netsmooth_knn=Netsmooth_knn)
         self$extract_top_contributing_genes(Ntop = Ntop)
         self$extract_metacell_gene_ranked_profiles(Ngenes = Ngenes)
         self$annotate_cell_network(AllAttrib=AllAttrib, AttribVec=AttribVec)
-        self$annotate_2D_coordinates_to_network(...,iters = iters2D, repForcesStrength = repForcesStrength2D)
+        self$annotate_2D_coordinates_to_network_UMAP(..., N_epochs=N_epochs, Compactness_level=Compactness_level)
         #self$annotate_3D_coordinates_to_network_aprox(Iters3Dapp = Iters3Dapp, Negweigths3Dapp=Negweigths3Dapp)
-        self$build_metacell_network()
-        self$build_network_backbone()
       },
       ################################################################
       #initialize = function(...) private$items <- list(...),
@@ -44,11 +42,14 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
       },
       ################################################################
       normalize_dge = function(...) {
-          X <- self$sce@assays[["counts"]]
-          lib_size = Matrix::colSums(X)
-          norm.out <- t(t(X)/lib_size * median(lib_size))
-          norm.out <- log(norm.out+1)
-          self$sce@assays[["logcounts"]] <- as(norm.out, "sparseMatrix")
+          if(!"logcounts"%in%names(self$sce@assays)) {
+            X <- self$sce@assays[["counts"]]
+            lib_size = Matrix::colSums(X)
+            norm.out <- t(t(X)/lib_size * median(lib_size))
+            norm.out <- log(norm.out+1)
+            self$sce@assays[["logcounts"]] <- as(norm.out, "sparseMatrix")
+          }
+          print("lognormalized")
       },
       ################################################################
       addQCMetrics = function(...) {
@@ -56,34 +57,56 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
         scater::calculateQCMetrics(self$sce, ...)
       },
       ################################################################
-      reduce_dge = function(..., PCAdim=30) {
-        x <- ACTION::reduce_GeneExpression(self$sce@assays[["logcounts"]], PCA_dim=PCAdim)
-        self$.__enclos_env__$private$items$metagene.cell <- x$cell_signatures
-        self$.__enclos_env__$private$items$gene.metagene <- x$V
+      reduce_dge = function(..., PCAdim=30, RedMethod = 1) {
+        x <- ACTIONred::reduceGeneExpression(self$sce@assays[["logcounts"]], reduced_dim=PCAdim, method = RedMethod)
+        self$.__enclos_env__$private$items$S_r <- x$S_r
+        self$.__enclos_env__$private$items$V <- x$V
+        self$.__enclos_env__$private$items$lambda <- x$lambda
+        self$.__enclos_env__$private$items$explained_var <- x$explained_var
+      },
+      ################################################################
+      check_rank_reduction = function(..., FracExplained=0.95) {
+        D <- min(which(self$.__enclos_env__$private$items$explained_var>FracExplained))-1
+        plot(self$.__enclos_env__$private$items$explained_var, type="b", pch=20, ylab="explained variance", xlab="r")
+        abline(v=D)
       },
       ################################################################
       decompose_sce = function(..., Kmin=2, Kmax = 20, NThreads=4) {
-        x <- ACTION::run_ACTION(self$.__enclos_env__$private$items$metagene.cell, k_min=Kmin, k_max = Kmax, numThreads = NThreads)
-        self$.__enclos_env__$private$items$ACTION.output <- x
-        self$.__enclos_env__$private$items$metacell.cell.trace <- rlist::list.remove(x$CellProfiles, 1)
-        self$.__enclos_env__$private$items$metagene.metacell.trace <- lapply(rlist::list.remove(x$SmoothingMats, 1), function(i) self$.__enclos_env__$private$items$metagene.cell%*%i)
+        x <- ACTIONcore::runACTION(self$.__enclos_env__$private$items$S_r, k_min=Kmin, k_max = Kmax, numThreads = NThreads)
+        self$.__enclos_env__$private$items$H <- x$H
+        self$.__enclos_env__$private$items$C <- x$C
       },
       ################################################################
-      build_cellnetwork = function(..., Kmax = 20, Knn = 30, NThreads=4) {
-        G <- ACTION::build_ACTIONnet(self$.__enclos_env__$private$items$ACTION.output$CellProfiles[1:Kmax], Knn, NThreads)
+      postprocess_archetypes = function(..., Filter_hubs=0, Smoothing_value=0.85) {
+        temp <- ACTIONetcore::postprocessArchetypes(S=self$sce@assays[["logcounts"]], C_trace = self$.__enclos_env__$private$items$C, H_trace = self$.__enclos_env__$private$items$H, filter_hubs = Filter_hubs, smoothing_value = Smoothing_value)
+        self$.__enclos_env__$private$items$backbone <- temp$backbone
+        self$.__enclos_env__$private$items$selected_archs <- temp$selected_archs
+        self$.__enclos_env__$private$items$landmark_cells <- temp$landmark_cells
+        self$.__enclos_env__$private$items$H_stacked <- temp$H_stacked
+        self$.__enclos_env__$private$items$C_stacked <- temp$C_stacked
+        self$.__enclos_env__$private$items$archetype_profile <- temp$archetype_profile
+        self$.__enclos_env__$private$items$smoothed_archetype_profile <- temp$smoothed_archetype_profile
+        self$.__enclos_env__$private$items$orthogonalized_smoothed_archetype_profile <- temp$orthogonalized_smoothed_archetype_profile
+
+        #names(self$.__enclos_env__$private$items$H) <-  paste0("D", 1:length(self$.__enclos_env__$private$items$H))
+        #for(i in 1:length(self$.__enclos_env__$private$items$H)) rownames(self$.__enclos_env__$private$items$H[[i]]) <- paste0("D", i, "_", 1:nrow(self$.__enclos_env__$private$items$H[[i]]))
+        #self$.__enclos_env__$private$items$multilevel.metacell.space <- do.call(rbind, self$.__enclos_env__$private$items$H)
+
+        self$backbone.network <- igraph::graph.adjacency(temp$backbone, mode = "undirected", weighted = T)
+        self$archetype.profiles <- temp$archetype_profile
+        rownames(self$archetype.profiles) <- rownames(self$sce)
+        #colnames(self$archetype.profiles) <- colnames(self$.__enclos_env__$private$items$multilevel.metacell.space)
+        self$smoothed.archetype.profiles <- temp$smoothed_archetype_profile
+        rownames(self$smoothed.archetype.profiles) <- rownames(self$sce)
+        #colnames(self$smoothed.archetype.profiles) <- colnames(archetype.profiles)
+        self$archetype.signatures <- temp$orthogonalized_smoothed_archetype_profile
+        rownames(self$archetype.signatures) <- rownames(self$sce)
+        #colnames(self$archetype.signatures) <- colnames(archetype.profiles)
+      },
+      ################################################################
+      build_cellnetwork = function(..., NThreads=4, NetMNN=0, Netsmooth_knn=1) {
+        G <- ACTIONetcore::buildAdaptiveACTIONet(H_stacked = self$.__enclos_env__$private$items$H_stacked, MNN = NetMNN, smooth_knn = Netsmooth_knn, thread_no = NThreads)
         self$network <- igraph::graph.adjacency(G, mode = "undirected", weighted = T)
-      },
-      ################################################################
-      extract_archetypal_patterns = function(...) {
-        names(self$.__enclos_env__$private$items$metacell.cell.trace) <-  paste0("D", 1:length(self$.__enclos_env__$private$items$metacell.cell.trace))
-        for(i in 1:length(self$.__enclos_env__$private$items$metacell.cell.trace)) rownames(self$.__enclos_env__$private$items$metacell.cell.trace[[i]]) <- paste0("D", i, "_", 1:nrow(self$.__enclos_env__$private$items$metacell.cell.trace[[i]]))
-        self$.__enclos_env__$private$items$metacell.cell.assignments.trace <- lapply(self$.__enclos_env__$private$items$metacell.cell.trace, function(i) apply(i, 2, which.max))
-        self$.__enclos_env__$private$items$metacell.cell.assignments.trace <- lapply(self$.__enclos_env__$private$items$metacell.cell.trace, function(i) apply(i, 2, which.max))
-        self$.__enclos_env__$private$items$multilevel.metacell.space <- do.call(rbind, self$.__enclos_env__$private$items$metacell.cell.trace)
-        self$.__enclos_env__$private$items$landmarks.idx <- apply(self$.__enclos_env__$private$items$multilevel.metacell.space, 1, which.max)
-        self$.__enclos_env__$private$items$landmarks <- as.data.frame(self$.__enclos_env__$private$items$landmarks.idx)
-        colnames(self$.__enclos_env__$private$items$landmarks) <- "cell.index"
-        self$.__enclos_env__$private$items$cell.multilevel.metacell.confidence <- apply(self$.__enclos_env__$private$items$multilevel.metacell.space, 2, max)
       },
       ################################################################
       compute_gene_metacell_contribution = function(...) {
@@ -92,23 +115,17 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
         self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution <- as.data.frame(out)
       },
       ################################################################
-      refine_metacell_space = function(...) {
-          temp <- ACTION::refine_solution(self$.__enclos_env__$private$items$metagene.cell, self$.__enclos_env__$private$items$metagene.cell%*%do.call(cbind, args = self$.__enclos_env__$private$items$ACTION.output$SmoothingMats))
-          self$.__enclos_env__$private$items$refined.decomposition <- temp
-          self$.__enclos_env__$private$items$multilevel.metacell.space.refined <- temp$Refined_H
-      },
-      ################################################################
       extract_top_contributing_genes = function(..., Ntop=10) {
-        out <- lapply(1:ncol(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution), function(i)  X = rownames(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution)[order(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution[,i], decreasing = T)][1:Ntop])
-        names(out) <- colnames(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution)
-        self$.__enclos_env__$private$items$metacell.top.contributing.genes <- out
+        out <- lapply(1:ncol(self$archetype.signatures), function(i) rownames(self$sce)[order(self$archetype.signatures[,i], decreasing = T)][1:Ntop])
+        names(out) <- colnames(self$archetype.signatures)
+        self$.__enclos_env__$private$items$archetype.top.contributing.genes <- out
       },
       ################################################################
       extract_metacell_gene_ranked_profiles = function(..., Ngenes=NULL) {
-         metacell.ranked.genes.list <- lapply(names(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution), function(i) rownames(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution)[order(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution[,i], decreasing = T)])
-        names(metacell.ranked.genes.list) <- names(self$.__enclos_env__$private$items$multilevel.gene.metacell.contribution)
-        if(!is.null(Ngenes)) metacell.ranked.genes.list <- lapply(metacell.ranked.genes.list, function(i) i[1:Ngenes])
-        self$.__enclos_env__$private$items$metacell.ranked.genes.list <- metacell.ranked.genes.list
+         archetype.ranked.genes.list <- lapply(colnames(self$archetype.signatures), function(i) rownames(self$archetype.signatures)[order(self$archetype.signatures[,i], decreasing = T)])
+        names(archetype.ranked.genes.list) <- colnames(self$archetype.signatures)
+        if(!is.null(Ngenes)) archetype.ranked.genes.list <- lapply(archetype.ranked.genes.list, function(i) i[1:Ngenes])
+        self$.__enclos_env__$private$items$archetype.ranked.genes.list <- archetype.ranked.genes.list
       },
       ################################################################
       annotate_cell_network = function(..., AllAttrib=TRUE, AttribVec="") {
@@ -118,15 +135,52 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
         colnames(Attrs) <- colnames(self$sce@colData)
         for(i in AttribVec) if(is.factor(Attrs[,i])) Attrs[,i] <- as.character(Attrs[,i])
         landmark <- rep("other", igraph::vcount(tempNet))
-        landmark[self$.__enclos_env__$private$items$landmarks.idx] <- "landmark"
+        landmarks.idx <- self$.__enclos_env__$private$items$landmark_cells[!self$.__enclos_env__$private$items$landmark_cells==0]
+        landmark[landmarks.idx] <- "landmark"
         igraph::V(tempNet)$landmark <- landmark
         for(i in AttribVec) tempNet <-  igraph::set_vertex_attr(tempNet, name = i, value=as.character(self$sce@colData[,i]))
+        igraph::V(tempNet)$assignment_confidence <-  apply(self$.__enclos_env__$private$items$H_stacked, 2, max)
         self$network <- tempNet
       },
       ################################################################
-      annotate_2D_coordinates_to_network = function(..., iters = 100, repForcesStrength = 5) {
+      annotate_2D_coordinates_to_network_PCA = function(...) {
+        #PCA.coor = t(reduction.out$S_r[1:2, selected_cells])
+        coor <- t(self$.__enclos_env__$private$items$S_r[1:2,])
         tempNet <- self$network
-        coor <-  ACTION::layout_ACTIONet(igraph::get.adjacency(tempNet, attr = "weight"), iters, repForcesStrength = repForcesStrength,  ...)
+        igraph::V(tempNet)$x <- coor[,1]
+        igraph::V(tempNet)$y <- coor[,2]
+        self$network <- tempNet
+      },
+      ################################################################
+      annotate_2D_coordinates_to_network_UMAP = function(..., N_epochs=100, Compactness_level=50) {
+        #umap.coor = layoutACTIONetUMAP(A[selected_cells, selected_cells], initial_coordinates = PCA.coor, n_epochs = 100, compactness_level = 50)
+        #FMMM.coor = layoutACTIONetFMMM(A[selected_cells, selected_cells], initial_coordinates = PCA.coor)
+        tempNet <- self$network
+        PCAcoor <- t(self$.__enclos_env__$private$items$S_r[1:2,])
+        coor <-  ACTIONetcore::layoutACTIONetUMAP(ACTIONet = igraph::get.adjacency(tempNet, attr = "weight"), initial_coordinates=PCAcoor, n_epochs = N_epochs, compactness_level = Compactness_level)
+        igraph::V(tempNet)$x <- coor[,1]
+        igraph::V(tempNet)$y <- coor[,2]
+        self$network <- tempNet
+      },
+      ################################################################
+      annotate_3D_coordinates_to_network_UMAP = function(..., N_epochs=100, Compactness_level=50) {
+        #umap.coor = layoutACTIONetUMAP(A[selected_cells, selected_cells], initial_coordinates = PCA.coor, n_epochs = 100, compactness_level = 50)
+        #FMMM.coor = layoutACTIONetFMMM(A[selected_cells, selected_cells], initial_coordinates = PCA.coor)
+        tempNet <- self$network
+        PCAcoor <- t(self$.__enclos_env__$private$items$S_r[1:3,])
+        coor <-  ACTIONetcore::layoutACTIONetUMAP(ACTIONet = igraph::get.adjacency(tempNet, attr = "weight"), initial_coordinates=PCAcoor, n_epochs = N_epochs, compactness_level = Compactness_level)
+        igraph::V(tempNet)$X <- coor[,1]
+        igraph::V(tempNet)$Y <- coor[,2]
+        igraph::V(tempNet)$Z <- coor[,3]
+        self$network <- tempNet
+      },
+      ################################################################
+      annotate_2D_coordinates_to_network_FMMM = function(..., N_epochs=100, Compactness_level=50) {
+        #umap.coor = layoutACTIONetUMAP(A[selected_cells, selected_cells], initial_coordinates = PCA.coor, n_epochs = 100, compactness_level = 50)
+        #FMMM.coor = layoutACTIONetFMMM(A[selected_cells, selected_cells], initial_coordinates = PCA.coor)
+        tempNet <- self$network
+        PCAcoor <- t(self$.__enclos_env__$private$items$S_r[1:2,])
+        coor <-  ACTIONetcore::layoutACTIONetFMMM(ACTIONet = igraph::get.adjacency(tempNet, attr = "weight"), initial_coordinates=PCAcoor, ...)
         igraph::V(tempNet)$x <- coor[,1]
         igraph::V(tempNet)$y <- coor[,2]
         self$network <- tempNet
@@ -143,23 +197,11 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
       ################################################################
       annotate_3D_coordinates_to_network_aprox = function(..., Iters3Dapp = 0, Negweigths3Dapp=1) {
         tempNet <- self$network
-        coor <- ACTION::layout_ACTIONet_3D(igraph::get.adjacency(tempNet, attr = "weight"), iters = Iters3Dapp, negate_weights = Negweigths3Dapp)
+        coor <- ACTIONetcore::layoutACTIONet3D(igraph::get.adjacency(tempNet, attr = "weight"), iters = Iters3Dapp, negate_weights = Negweigths3Dapp)
         igraph::V(tempNet)$X <- coor[,1]
         igraph::V(tempNet)$Y <- coor[,2]
         igraph::V(tempNet)$Z <- coor[,3]
         self$network <- tempNet
-      },
-      ################################################################
-      build_metacell_network = function(...) {
-        CC <- cor(t(self$.__enclos_env__$private$items$multilevel.metacell.space))
-        diag(CC) <- 0
-        CC[CC<0] <- 0
-        #CC <- glasso::glasso(CC, rho=0.2)
-        self$metacell.network <- igraph::graph.adjacency(CC, weighted = T, mode = "undirected")
-      },
-      ################################################################
-      build_network_backbone = function(...) {
-        self$backbone.network <- igraph::graph.adjacency(ACTION::construct_backbone(self$.__enclos_env__$private$items$multilevel.metacell.space), weighted = T, mode = "undirected")
       },
       ################################################################
       plot_ACTIONnet = function(..., AttrName=NULL, CPall="npg", Vsize=3, PlotLegend=TRUE, Gene=NULL, ColGroups=FALSE, Basecolor="tomato", LegendPos="bottomleft", TransScore=NULL) {
@@ -309,46 +351,3 @@ ACTIONnet <- R6Class("ACTIONnet", lock_objects=FALSE, lock_class=FALSE,
   )
 )
 
-Plot.filled.after.propagation <- function(Insce, InNet, Ingene, Cex=0.25, detectionCut=1) {
-    temp <- split(as.numeric(Propagate.gene(Insce, InNet, InGenes = Ingene)),as.numeric(Insce@assays[["counts"]][Ingene,]))
-    Insce@colData$x <- V(InNet)$x
-    Insce@colData$y <- V(InNet)$y
-    Insce@colData$temp.annot <- as.character(Insce@assays[["counts"]][Ingene,])
-    sce.splitted <- Split.sce.cols(Insce, "temp.annot")
-    sce.splitted$`0`@colData$temp.annot <- Binarize(temp$`0`)
-
-    par(mfrow=c(2,2), mar=c(0,0,2,0))
-      plot(sce.splitted$`0`@colData$x, sce.splitted$`0`@colData$y, pch=20, cex=Cex, axes=F, xlab="", ylab="", main=paste(Ingene, "undetected"))
-
-      plot(sce.splitted$`0`@colData$x, sce.splitted$`0`@colData$y, pch=20, cex=Cex, col=ifelse(sce.splitted$`0`@colData$temp.annot==1,"red", "black"), axes=F, xlab="", ylab="", main=paste(Ingene, "undetected (after propagation - red)"))
-
-      plot(Insce@colData$x[as.numeric(Insce@colData$temp.annot)>detectionCut], Insce@colData$y[as.numeric(Insce@colData$temp.annot)>detectionCut], pch=20, cex=Cex, axes=F, xlab="", ylab="", main=paste(Ingene, "detected"))
-
-      plot(sce.splitted[[length(sce.splitted)]]@colData$x, sce.splitted[[length(sce.splitted)]]@colData$y, pch=20, cex=Cex, axes=F, xlab="", ylab="", main=paste(Ingene, "high counts"))
-    par(mfrow=c(1,1))
-}
-
-Plot.filled.after.propagation.boxplot <- function(Insce, InNet, Ingene, Cex=0.2) {
-  coords <- Extract.2D.layout(InNet)
-   Insce@colData$x <- coords[,1]
-   Insce@colData$y <- coords[,2]
-  x.counts <- Insce@assays[["counts"]][Ingene,]
-  PropScore <- Propagate.gene(Insce, InNet, Ingene)
-  PropScore.splitted <- split(PropScore,x.counts)
-  Insce@colData$temp.annot <- as.character(x.counts)
-  sce.splitted <- Split.sce.cols(Insce, "temp.annot")
-  sce.splitted$`0`@colData$temp.annot <- Binarize(PropScore.splitted$`0`)
-
-  #pdf("temp.pdf")
-  #layout(matrix(c(1,1,2,2)), heights = c(5,1))
-  layout(matrix(c(1,2,1,2,3,3), 2, 3), heights = c(5,1), widths = c(1,1,3))
-  par(mar=c(4,4,1,0))
-  boxplot(PropScore.splitted, axes=F, ylab="propagation score", main=Ingene, pars=list(outcol=c("red", rep("grey", length(PropScore.splitted)-1)), outpch=20, outcex=c(1.5, rep(1, length(PropScore.splitted)-1))))
-  #box()
-  #axis(side = 1, labels = NA, tck=0)
-  axis(side = 2)
-  barplot(sapply(PropScore.splitted, length), ylab="cell count", xlab="read counts", col="black")
-  plot(sce.splitted$`0`@colData$x, sce.splitted$`0`@colData$y, pch=20, cex=Cex, col=ifelse(sce.splitted$`0`@colData$temp.annot==1,"red", "black"), axes=F, xlab="", ylab="", main="propagated scores")
-  #dev.off()
-  #Openfile("temp.pdf")
-}
